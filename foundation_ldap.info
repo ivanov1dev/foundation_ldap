@@ -1,0 +1,10 @@
+name = Foundation LDAP
+description = Foundation LDAP
+core = 7.x
+version = 7.x-1.0
+project = foundation_ldap
+project path = sites/all/modules/third
+
+dependencies[] = ldap_servers
+
+files[] = FoundationLdap.php

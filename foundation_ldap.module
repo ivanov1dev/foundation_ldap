@@ -1,0 +1,268 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function foundation_ldap_menu() {
+  return [
+    'admin/people/permissions/ldap' => [
+      'title' => t('LDAP'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('foundation_ldap_settings_form'),
+      'access arguments' => array('administer permissions'),
+      'type' => MENU_LOCAL_TASK,
+    ],
+  ];
+}
+
+/**
+ * Form.
+ *
+ * @param $form
+ * @param $form_state
+ * @return mixed
+ */
+function foundation_ldap_settings_form($form, &$form_state) {
+
+  $roles = user_roles();
+  $role_permissions = array_reduce(user_role_permissions($roles), function ($perms, $item) {
+    return array_merge($perms ?: [], $item);
+  });
+
+  $permissions_options = [];
+  $roles_options = $roles;
+
+  $module_info = system_get_info('module');
+  $modules = [];
+  foreach (module_implements('permission') as $module) {
+    $modules[$module] = $module_info[$module]['name'];
+  }
+  asort($modules);
+
+  foreach ($modules as $module => $display_name) {
+    if ($permissions = module_invoke($module, 'permission')) {
+      foreach ($permissions as $perm => $perm_item) {
+        if (array_key_exists($perm, $role_permissions)) {
+          $permissions_options[$perm] = $perm_item['title'];
+        }
+      }
+    }
+  }
+
+  foreach (['roles', 'permissions'] as $weight => $item) {
+    $wrapper_id = 'export_' . $item;
+    $options = $item . '_options';
+    $form[$wrapper_id] = [
+      '#type' => 'fieldset',
+      '#title' => 'Экспорт ' . t(ucfirst($item)),
+      '#weight' => $weight,
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+    ];
+
+    $form[$wrapper_id][$item] = [
+      '#type' => 'select',
+      '#title' => 'Выберите',
+      '#multiple' => TRUE,
+      '#options' => $$options,
+    ];
+
+    $form[$wrapper_id][$item . '_export'] = [
+      '#type' => 'submit',
+      '#name' => $item . '_export',
+      '#value' => 'Экспортировать',
+      '#submit' => ['foundation_ldap_export_submit'],
+    ];
+
+    $form[$wrapper_id][$item . '_export_all'] = [
+      '#type' => 'submit',
+      '#name' => $item . '_export_all',
+      '#value' => 'Экспортировать все',
+      '#submit' => ['foundation_ldap_export_submit'],
+    ];
+  }
+
+  return $form;
+}
+
+/**
+ * Validate.
+ * @see foundation_ldap_settings_form()
+ */
+function foundation_ldap_settings_form_validate($form, &$form_state) {
+
+  if (isset($form_state["triggering_element"])) {
+    $isAll = substr($form_state["triggering_element"]["#name"], -3) == 'all';
+    if ($isAll) {
+      $type = substr($form_state["triggering_element"]["#name"], 0, -11);
+      $items = $form["export_" . $type][$type]["#options"];
+      $form_state["values"][$type] = array_keys($items);
+      $form_state['#export_type'] = $type;
+      return;
+    }
+    else {
+      $type = substr($form_state["triggering_element"]["#name"], 0, -7);
+      $form_state['#export_type'] = $type;
+    }
+
+    if (empty($form_state['values'][$type])) {
+      form_error($form['export_' . $type][$type], 'Выберите значение!');
+    }
+  }
+}
+
+/**
+ * Submit export.
+ * @see foundation_ldap_settings_form()
+ */
+function foundation_ldap_export_submit($form, &$form_state) {
+
+  $type = $form_state["#export_type"];
+
+  $items = $form_state['values'][$type];
+
+  $operations = [];
+  foreach ($items as $item) {
+    $operations[] = ['_foundation_ldap_export_' . $type, [$item]];
+  }
+
+  $batch = [
+    'title' => 'Экспорт ' . t(ucfirst($type)),
+    'operations' => $operations,
+    'finished' => '_foundation_ldap_export_batch_finished'
+  ];
+  batch_set($batch);
+}
+
+/**
+ * @param $permission
+ * @param $context
+ * @see foundation_ldap_export_submit()
+ */
+function _foundation_ldap_export_permissions($permission, &$context) {
+
+   if (empty($context["results"])) {
+     $context["results"]['items'] = 0;
+   }
+
+  $servers = ldap_servers_get_servers(NULL, 'enabled');
+  if (!$servers) {
+    drupal_set_message('Server LDAP not enabled!', 'warning');
+    throw new RuntimeException('Server LDAP not enabled!');
+  }
+
+  $server = reset($servers);
+  $server = new FoundationLdap($server->sid);
+
+  if (!$server->permissionExists($permission)) {
+    if ($server->createPermission($permission)) {
+      $context['results']['items']++;
+    }
+  }
+
+}
+
+/**
+ * @param int $role_id
+ * @param array $context
+ */
+function _foundation_ldap_export_roles($role_id, &$context) {
+
+  if (empty($context["results"])) {
+    $context["results"]['items'] = 0;
+    $context["results"]['type'] = 'roles';
+  }
+
+  $role_permissions = user_role_permissions(user_roles(TRUE));
+  $role_permissions = $role_permissions[$role_id];
+  $role = user_role_load($role_id);
+  $role_name = $role->name;
+
+  $servers = ldap_servers_get_servers(NULL, 'enabled');
+  if (!$servers) {
+    drupal_set_message('Server LDAP not enabled!', 'warning');
+    throw new RuntimeException('Server LDAP not enabled!');
+  }
+
+  $server = reset($servers);
+  $server = new FoundationLdap($server->sid);
+
+  $privilege_name = $role_name . ' privilege';
+
+  if ($role = $server->roleExists($role_name, 'ldap_entry')) {
+    $context['results']['items']++;
+
+    // Находим привилегию
+    if ($privilege = $server->privilegeExists($privilege_name, 'ldap_entry', [$server->groupUserMembershipsAttr])) {
+
+      // Получаем права доступа
+      if (!empty($privilege[$server->groupUserMembershipsAttr])) {
+        // Проверяем какие права уже назначены и какие убраны
+        $privilege_perms = $privilege[$server->groupUserMembershipsAttr];
+        unset($privilege_perms["count"]);
+
+        if ($diff_perms = $server->diffEntries($privilege_perms, array_keys($role_permissions))) {
+          // удаляем права доступа
+          foreach ($diff_perms as $diff_perm) {
+            if ($diff_perm = $server->permissionExists($diff_perm, 'ldap_entry')) {
+              $server->removeMember($diff_perm['dn'], $privilege['dn']);
+            }
+          }
+        }
+
+        if ($new_perms = $server->diffEntries(array_keys($role_permissions), $privilege_perms)) {
+          // Добавляем новые права
+          foreach ($new_perms as $new_perm) {
+            $server->addPermission($privilege['dn'], $new_perm);
+          }
+        }
+      }
+      else {
+        // Добавляем права доступа
+        foreach (array_keys($role_permissions) as $permission_name) {
+          $server->addPermission($privilege['dn'], $permission_name);
+        }
+      }
+    }
+    else {
+      if ($privilege = $server->createPrivilege($privilege_name)) {
+        // Добавляем к роли
+        $server->bindPrivilege($role['dn'], $privilege);
+
+        // Добавляем права
+        foreach (array_keys($role_permissions) as $permission_name) {
+          $server->addPermission($privilege, $permission_name);
+        }
+      }
+    }
+  }
+  else {
+    // Создаем роль
+    if ($role = $server->createRole($role_name)) {
+      $context['results']['items']++;
+      // Создаем привилегию
+      if ($privilege = $server->createPrivilege($privilege_name)) {
+        $server->bindPrivilege($role, $privilege);
+        foreach (array_keys($role_permissions) as $permission_name) {
+          $server->addPermission($privilege, $permission_name);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @param $success
+ * @param $results
+ * @param $operations
+ * @see foundation_ldap_export_submit()
+ */
+function _foundation_ldap_export_batch_finished($success, $results, $operations) {
+  if ($success) {
+
+    drupal_set_message('Дабавлено ' . $results['items']);
+  }
+  else {
+    drupal_set_message('Завершено с ошибками.', 'error');
+  }
+}
